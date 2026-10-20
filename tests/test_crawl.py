@@ -277,3 +277,39 @@ def test_the_crawler_only_ever_reads(tmp_path):
     for verb in ("POST", "PUT", "PATCH", "DELETE"):
         assert f'method="{verb}"' not in src
     assert "urlencode" in src and "data=" not in src.replace("data = ", "")
+
+
+# ---------------------------------------------------------------------------------------------
+# Arabic words in addresses (found on the first real run)
+# ---------------------------------------------------------------------------------------------
+def test_encode_url_percent_encodes_arabic_and_keeps_encoded_parts():
+    raw = "https://www.alnukhbastore.com/ar/shop/category/\u0647\u0648\u0627\u062a\u0641-5/page/2?attribute_value=9-1"
+    out = crawl.encode_url(raw)
+    assert out.isascii()
+    assert out.startswith("https://www.alnukhbastore.com/ar/shop/category/%D9%87")
+    assert out.endswith("/page/2?attribute_value=9-1")
+    assert crawl.encode_url(out) == out  # already encoded: unchanged
+
+
+def test_http_get_sends_only_ascii_addresses(monkeypatch):
+    seen = []
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"ok"
+
+    def fake_urlopen(req, timeout=0):
+        seen.append(req.full_url)
+        assert req.get_method() == "GET"
+        return Resp()
+
+    monkeypatch.setattr(crawl.urllib.request, "urlopen", fake_urlopen)
+    http = crawl.Http("https://www.alnukhbastore.com", min_interval=0)
+    assert http.get("/ar/shop/\u0643\u064a\u0633-76") == "ok"
+    assert seen and seen[0].isascii()

@@ -267,6 +267,23 @@ def parse_product(html: str, site: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------------------------
 # Network
 # ---------------------------------------------------------------------------------------------
+def encode_url(url: str) -> str:
+    """Percent-encodes non-ASCII characters (the shop uses Arabic words in its addresses) and leaves
+    everything that is already encoded alone. urllib refuses addresses that contain raw Arabic."""
+    parts = urllib.parse.urlsplit(url)
+    safe = "/%:@!$&'()*+,;=-._~"
+    netloc = parts.netloc
+    if not netloc.isascii():
+        netloc = netloc.encode("idna").decode("ascii")
+    return urllib.parse.urlunsplit((
+        parts.scheme,
+        netloc,
+        urllib.parse.quote(parts.path, safe=safe),
+        urllib.parse.quote(parts.query, safe=safe + "?"),
+        "",
+    ))
+
+
 class Blocked(Exception):
     """The website asked us to stop (403 / 429). We stop too and keep the previous data."""
 
@@ -281,7 +298,7 @@ class Http:
         self.requests = 0
 
     def get(self, path_or_url: str) -> str:
-        url = absolute(self.site, path_or_url)
+        url = encode_url(absolute(self.site, path_or_url))
         for attempt in range(1, self.retries + 1):
             wait = self.min_interval - (time.monotonic() - self._last)
             if wait > 0:
@@ -487,7 +504,12 @@ def run(args: argparse.Namespace, log=print) -> int:
             cats = parse_categories(shop_html)
             new_cat_of: Dict[int, Tuple[int, str]] = {}
             for cat in cats:
-                for card in crawl_listing(http, prefix, category_href=cat.href, max_pages=args.max_pages):
+                try:
+                    cat_cards = crawl_listing(http, prefix, category_href=cat.href, max_pages=args.max_pages)
+                except (urllib.error.HTTPError, urllib.error.URLError) as e:
+                    log(f"  category {cat.id} skipped ({e}).")
+                    continue
+                for card in cat_cards:
                     new_cat_of.setdefault(card.id, (cat.id, cat.name))
             brands = parse_brand_filters(shop_html)
             if brands and not http.robots_allow(f"{prefix}/shop?attribute_value={brands[0].value}"):
@@ -496,7 +518,12 @@ def run(args: argparse.Namespace, log=print) -> int:
             new_brand_of: Dict[int, str] = {}
             for b in brands:
                 q = urllib.parse.urlencode({"attribute_value": b.value})
-                for card in crawl_listing(http, prefix, query=q, max_pages=args.max_pages):
+                try:
+                    brand_cards = crawl_listing(http, prefix, query=q, max_pages=args.max_pages)
+                except (urllib.error.HTTPError, urllib.error.URLError) as e:
+                    log(f"  brand {b.name} skipped ({e}).")
+                    continue
+                for card in brand_cards:
                     new_brand_of.setdefault(card.id, b.name)
             if new_cat_of:
                 cat_of = new_cat_of
@@ -516,7 +543,11 @@ def run(args: argparse.Namespace, log=print) -> int:
             except urllib.error.HTTPError as e:
                 if e.code == 404:
                     continue
-                raise
+                log(f"  product {pid} skipped ({e.code}).")
+                continue
+            except urllib.error.URLError as e:
+                log(f"  product {pid} skipped ({e}).")
+                continue
             parsed = parse_product(html, site)
             if parsed.get("stock") is None and details.get(pid, {}).get("stock"):
                 parsed["stock"] = details[pid]["stock"]
