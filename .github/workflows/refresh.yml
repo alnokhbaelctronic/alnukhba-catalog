@@ -1,0 +1,63 @@
+# Reads the PUBLIC pages of the store website (plain GET requests, one page at a time, slowly)
+# and publishes the result as static JSON files on GitHub Pages. The phone app reads those files.
+# Nothing is ever written to the website or to the ERP.
+name: Refresh catalogue
+
+on:
+  schedule:
+    - cron: "23 * * * *"   # every hour
+  workflow_dispatch:
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r crawler/requirements.txt pytest
+
+      - name: Self-test of the reader
+        run: python -m pytest -q tests
+
+      - name: Previous state (what was checked last time)
+        run: |
+          curl -fsSL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/v1/state.json" -o prev_state.json || echo '{}' > prev_state.json
+          ls -l prev_state.json
+
+      - name: Read the store website
+        run: python crawler/crawl.py --out site --prev-state prev_state.json
+
+      - name: Publish to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          force_orphan: true
+          user_name: "catalogue-bot"
+          user_email: "catalogue-bot@users.noreply.github.com"
+          commit_message: "Catalogue update"
+
+      - name: Keep the schedule alive (GitHub pauses idle schedules after 60 days)
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $((now - last)) -gt $((30*86400)) ]; then
+            git config user.name "catalogue-bot"
+            git config user.email "catalogue-bot@users.noreply.github.com"
+            git commit --allow-empty -m "keep schedule alive"
+            git push
+          fi
