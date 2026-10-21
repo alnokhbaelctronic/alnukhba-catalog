@@ -347,6 +347,27 @@ def test_page_that_says_few_pieces_are_left_is_shown_as_last_pieces():
     assert crawl.parse_product(empty, "https://x.test")["stock"] == "available"
 
 
+def test_product_without_a_category_does_not_force_a_reread_of_categories_every_run(tmp_path):
+    fake = FakeSite()
+    fake.products[4] = ("شاحن", "60.000", "", 0)  # listed in the shop but in no category
+    orig_get = fake.get
+
+    def get(path):
+        if path.split("?")[0].endswith("/shop/page/2"):
+            return listing([card(3, "كيس", "495.000"), card(4, "شاحن", "60.000")], last_page=2)
+        return orig_get(path)
+
+    fake.get = get
+    code, out = run_with(fake, tmp_path)
+    assert code == 0
+    by_id = {p["id"]: p for p in json.loads((out / "v1" / "catalog.json").read_text(encoding="utf-8"))["products"]}
+    assert by_id[4]["category_id"] == 0
+    fake.hits.clear()
+    code, out2 = run_with(fake, tmp_path / "next", prev=out / "v1" / "state.json", budget=0)
+    assert code == 0
+    assert not [h for h in fake.hits if "/category/" in h]  # nothing new: categories are not read again
+
+
 def test_state_of_an_older_reader_keeps_availability_but_rereads_brands_and_categories(tmp_path):
     fake = FakeSite()
     code, out = run_with(fake, tmp_path)

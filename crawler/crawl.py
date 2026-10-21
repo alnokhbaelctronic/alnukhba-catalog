@@ -600,6 +600,10 @@ def run(args: argparse.Namespace, log=print) -> int:
                         if guessed:
                             new_brand_of[card.id] = guessed
             if new_cat_of:
+                for pid in ids:
+                    # products that belong to no public category are remembered too (category 0),
+                    # otherwise they would look "new" on every run and force a re-read each hour
+                    new_cat_of.setdefault(pid, (0, ""))
                 cat_of = new_cat_of
             brand_of = new_brand_of or brand_of
             mapped_at = started
