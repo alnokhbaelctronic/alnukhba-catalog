@@ -35,7 +35,13 @@ jobs:
 
       - name: Previous state (what was checked last time)
         run: |
-          curl -fsSL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/v1/state.json" -o prev_state.json || echo '{}' > prev_state.json
+          # Read it from the publishing branch itself, so it works even before GitHub Pages is switched on.
+          if git fetch --depth=1 origin gh-pages 2>/dev/null && git show FETCH_HEAD:v1/state.json > prev_state.json 2>/dev/null; then
+            echo "previous state found"
+          else
+            echo '{}' > prev_state.json
+            echo "no previous state: this is the first full read"
+          fi
           ls -l prev_state.json
 
       - name: Read the store website

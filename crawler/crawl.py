@@ -99,10 +99,15 @@ def parse_listing(html: str) -> List[Card]:
         pid = trailing_id(href)
         if pid is None:
             continue
-        name = (el.get("data-name") or "").strip()
+        # NOTE: the "data-name" attribute of a card is only the label of the page-builder block
+        # ("المنتج" = "Product") and is identical for every card, so it is never used as a name.
+        title = el.select_one(".o_wsale_products_item_title") or el.select_one("h2, h3, h6")
+        name = clean_text(title.get_text(" ", strip=True)) if title else ""
         if not name:
-            title = el.select_one(".o_wsale_products_item_title") or el.select_one("h6") or link
-            name = title.get_text(" ", strip=True)
+            form = el.select_one("form[aria-label]")
+            name = clean_text(form.get("aria-label", "")) if form else ""
+        if not name:
+            name = clean_text(link.get("title", "") or link.get_text(" ", strip=True))
         price_box = el.select_one(".product_price") or el
         old_price: Optional[float] = None
         price: Optional[float] = None
@@ -141,6 +146,18 @@ class Category:
     depth: int
 
 
+def visible_label(a: Any) -> str:
+    """The Arabic text of a menu link. The shop's menus hold the English and the Arabic wording side by
+    side (classes anx-lang-en / anx-lang-ar) and show one of them, so only the Arabic one is taken."""
+    ar = a.select_one(".anx-lang-ar")
+    if ar is not None and ar.get_text(strip=True):
+        return " ".join(ar.get_text(" ", strip=True).split())
+    copy = BeautifulSoup(str(a), "lxml")
+    for junk in copy.select(".anx-lang-en, svg, script, style"):
+        junk.decompose()
+    return " ".join(copy.get_text(" ", strip=True).split())
+
+
 def parse_categories(html: str) -> List[Category]:
     """Top-level categories of the shop sidebar (children are folded into their parent by the shop)."""
     soup = BeautifulSoup(html, "lxml")
@@ -148,7 +165,7 @@ def parse_categories(html: str) -> List[Category]:
     for a in soup.select("a[href*='/shop/category/']"):
         href = a["href"].split("?")[0]
         cid = trailing_id(href)
-        name = a.get_text(" ", strip=True)
+        name = visible_label(a)
         if cid is None or not name:
             continue
         depth = len(a.find_parents(["ul", "ol"]))
@@ -167,6 +184,14 @@ class BrandFilter:
 
 
 BRAND_TITLES = ("العلامة التجارية", "العلامه التجاريه", "الماركة", "brand")
+# The checkboxes of the sidebar are named "attribute_value", but the shop's own script turns a ticked
+# box into the address parameter "attribute_values" (e.g. /ar/shop?attribute_values=9-3). Only that
+# spelling really filters the list, so it is the one used here.
+BRAND_QUERY = "attribute_values"
+
+# Version of the layout of state.json (2 = names from the visible titles, brands from the real filter
+# spelling and from the product names).
+STATE_SCHEMA = 2
 
 
 def parse_brand_filters(html: str) -> List[BrandFilter]:
@@ -190,6 +215,31 @@ def parse_brand_filters(html: str) -> List[BrandFilter]:
                 seen.add(value)
                 out.append(BrandFilter(value, name))
     return out
+
+
+LOW_STOCK_NOTE = re.compile(
+    r"only\s+\d+|\d+\s+(units?\s+)?left|متبق|فقط\s*[\d٠-٩]|آخر\s+(ال)?(كميات|قطع)|كمية\s+محدودة|الكمية\s+محدودة",
+    re.IGNORECASE,
+)
+
+_WORD_CHARS = re.compile(r"[^0-9a-z؀-ۿ]+")
+
+
+def _words(text: str) -> str:
+    return " " + _WORD_CHARS.sub(" ", (text or "").lower()).strip() + " "
+
+
+def infer_brand(name: str, labels: List[str]) -> str:
+    """The longest brand of the shop's brand list that appears as whole words in the product name."""
+    haystack = _words(name)
+    best_label, best_len = "", 0
+    for label in labels:
+        needle = _words(label)
+        if len(needle.strip()) < 2:
+            continue
+        if needle in haystack and len(needle) > best_len:
+            best_label, best_len = label, len(needle)
+    return best_label
 
 
 AVAILABILITY_MAP = {
@@ -245,6 +295,12 @@ def parse_product(html: str, site: str) -> Dict[str, Any]:
             detail["stock"] = map_availability(str(offers.get("availability") or ""))
             detail["ld_price"] = parse_number(str(offers.get("price") or ""))
         break
+
+    # If the page itself says that only a few pieces are left, the product is shown as "last pieces".
+    # (The shop does not print this in the page today, so normally nothing is found here.)
+    note = " ".join(e.get_text(" ", strip=True) for e in soup.select(".availability_messages, .availability_message"))
+    if note and detail["stock"] != "out" and LOW_STOCK_NOTE.search(note):
+        detail["stock"] = "low"
 
     seen = set()
     images: List[str] = []
@@ -475,6 +531,10 @@ def run(args: argparse.Namespace, log=print) -> int:
 
     prev_state = load_json(args.prev_state) if args.prev_state else None
     prev_state = prev_state if isinstance(prev_state, dict) else {}
+    if prev_state.get("products") and prev_state.get("schema") != STATE_SCHEMA:
+        # Written by an older version of the reader: what it learnt about availability is kept,
+        # but categories and brands are read again (the old brand list was wrong).
+        prev_state = dict(prev_state, category_of={}, brand_of={}, mapped_at=0)
     bootstrap = not prev_state.get("products")
     pstate: Dict[str, Dict[str, Any]] = prev_state.get("products", {}) if not bootstrap else {}
     details: Dict[int, Dict[str, Any]] = {int(k): v.get("detail", {}) for k, v in pstate.items()}
@@ -512,19 +572,33 @@ def run(args: argparse.Namespace, log=print) -> int:
                 for card in cat_cards:
                     new_cat_of.setdefault(card.id, (cat.id, cat.name))
             brands = parse_brand_filters(shop_html)
-            if brands and not http.robots_allow(f"{prefix}/shop?attribute_value={brands[0].value}"):
+            if brands and not http.robots_allow(f"{prefix}/shop?{BRAND_QUERY}={brands[0].value}"):
                 log("robots.txt does not allow the brand filter pages: brands are skipped.")
                 brands = []
             new_brand_of: Dict[int, str] = {}
             for b in brands:
-                q = urllib.parse.urlencode({"attribute_value": b.value})
+                q = urllib.parse.urlencode({BRAND_QUERY: b.value})
                 try:
                     brand_cards = crawl_listing(http, prefix, query=q, max_pages=args.max_pages)
                 except (urllib.error.HTTPError, urllib.error.URLError) as e:
                     log(f"  brand {b.name} skipped ({e}).")
                     continue
+                if len(brands) > 1 and len(brand_cards) >= 0.9 * len(ids):
+                    # The shop ignored the filter and returned (almost) everything: a wrong brand on
+                    # every product is worse than no brand, so this brand is not used.
+                    log(f"  brand {b.name} skipped (the filter returned {len(brand_cards)} of {len(ids)} products).")
+                    continue
                 for card in brand_cards:
                     new_brand_of.setdefault(card.id, b.name)
+            if brands:
+                # The shop's own brand filter lists brands but (today) finds no products for them, so
+                # a brand is also taken from the product name when a listed brand is written in it.
+                labels = [b.name for b in brands]
+                for card in cards:
+                    if card.id not in new_brand_of:
+                        guessed = infer_brand(card.name, labels)
+                        if guessed:
+                            new_brand_of[card.id] = guessed
             if new_cat_of:
                 cat_of = new_cat_of
             brand_of = new_brand_of or brand_of
@@ -569,6 +643,7 @@ def run(args: argparse.Namespace, log=print) -> int:
     for pid, item in full.items():
         write_json(os.path.join(out, "v1", "products", f"{pid}.json"), item)
     state = {
+        "schema": STATE_SCHEMA,
         "built_at": catalog["built_at"],
         "mapped_at": mapped_at,
         "category_of": {str(k): [v[0], v[1]] for k, v in cat_of.items() if k in set(ids)},

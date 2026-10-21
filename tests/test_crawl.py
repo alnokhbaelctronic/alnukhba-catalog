@@ -17,11 +17,11 @@ import crawl  # noqa: E402
 def card(pid, name, price, old=None, slug="item"):
     old_html = f'<del class="text-muted me-1"><span class="oe_currency_value">{old}</span></del>' if old else ""
     return f"""
-    <div class="oe_product g-col-6" data-name="{name}">
-      <form><div class="oe_product_cart">
-        <a class="oe_product_image_link" href="/ar/shop/{slug}-{pid}?category=1"><img class="oe_product_image_img" src="/web/image/product.template/{pid}/image_512"/></a>
+    <div class="oe_product g-col-6" data-name="&#1575;&#1604;&#1605;&#1606;&#1578;&#1580;">
+      <form role="article" aria-label="{name}"><div class="oe_product_cart">
+        <a class="oe_product_image_link" title="{name}" href="/ar/shop/{slug}-{pid}?category=1"><img class="oe_product_image_img" src="/web/image/product.template/{pid}/image_512"/></a>
         <div class="o_wsale_product_information">
-          <h6 class="o_wsale_products_item_title"><a href="/ar/shop/{slug}-{pid}">{name}</a></h6>
+          <h2 class="o_wsale_products_item_title text-break"><a href="/ar/shop/{slug}-{pid}"><span>{name}</span></a></h2>
           <div class="product_price">{old_html}<span class="oe_currency_value">{price}</span> ل.د</div>
         </div>
       </div></form>
@@ -95,6 +95,16 @@ def test_parse_listing_reads_id_name_price_and_discount():
     assert cards[0].href == "/ar/shop/item-75"
 
 
+def test_parse_listing_never_uses_the_page_builder_label_as_the_name():
+    # the live shop puts data-name="المنتج" ("Product") on every card; the real name is elsewhere
+    cards = crawl.parse_listing(listing([card(7, "أريكة ألعاب Cougar", "1,590.000")]))
+    assert cards[0].name == "أريكة ألعاب Cougar" and cards[0].name != "المنتج"
+    # when the visible title is missing the accessible label / link title are used
+    html = listing([card(8, "كيس XPG", "10.000")]).replace('class="o_wsale_products_item_title text-break"', 'class="x"')
+    html = html.replace("<h2 class=\"x\"><a href=\"/ar/shop/item-8\"><span>كيس XPG</span></a></h2>", "")
+    assert crawl.parse_listing(html)[0].name == "كيس XPG"
+
+
 def test_parse_last_page():
     assert crawl.parse_last_page(listing([], last_page=61)) == 61
     assert crawl.parse_last_page(listing([], last_page=1)) == 1
@@ -105,6 +115,16 @@ def test_categories_keep_only_the_top_level():
     cats = crawl.parse_categories(SIDEBAR.replace('<li><a href="/ar/shop">كافة المنتجات</a></li>', ""))
     assert {c.id for c in cats} == {2, 3}
     assert {c.name for c in cats} == {"الكمبيوتر والجيمينج", "اجهزة الصوت"}
+
+
+def test_category_names_take_only_the_arabic_wording_of_the_bilingual_menu():
+    html = """<ul>
+      <li><a href="/ar/shop/category/electronics-267"><span class="anx-mm-icon"><svg><path d="M1"/></svg></span>
+        <span class="anx-mm-label anx-lang-en">Electronics</span><span class="anx-mm-label anx-lang-ar">الإلكترونيات</span></a></li>
+      <li><a href="/ar/shop/category/bags-179"><span class="anx-lang-en">Bags</span> حقائب</a></li>
+    </ul>"""
+    cats = {c.id: c.name for c in crawl.parse_categories(html)}
+    assert cats == {267: "الإلكترونيات", 179: "حقائب"}
 
 
 def test_brand_filters_only_from_the_brand_group():
@@ -173,9 +193,11 @@ class FakeSite:
             return self.page_for([1, 3], 1, 1)
         if "category/audio-3" in p:
             return self.page_for([2], 1, 1)
-        if "attribute_value=9-1" in q:
+        # Only the address parameter the real shop understands ("attribute_values") filters; the
+        # misspelt one is ignored by the shop and returns the full list, as the live site does.
+        if "attribute_values=9-1" in q:
             return self.page_for([1, 3], 1, 1)
-        if "attribute_value=9-3" in q:
+        if "attribute_values=9-3" in q:
             return self.page_for([2], 1, 1)
         if p.endswith("/shop"):
             return listing([card(i, self.products[i][0], self.products[i][1]) for i in (1, 2)], last_page=2, extra=SIDEBAR)
@@ -269,6 +291,82 @@ def test_too_few_products_never_replaces_good_data(tmp_path):
     code, out = run_with(fake, tmp_path, min_products=50)
     assert code == 2
     assert not (out / "v1" / "catalog.json").exists()
+
+
+def test_brand_filter_that_returns_everything_is_not_trusted(tmp_path):
+    # the shop ignores an unknown filter spelling and lists every product: no brand may be assigned from it
+    fake = FakeSite()
+    orig_get = fake.get
+
+    def get(path):
+        if "attribute_values=" in path:
+            return fake.page_for([1, 2, 3], 1, 1)
+        return orig_get(path)
+
+    fake.get = get
+    code, out = run_with(fake, tmp_path)
+    assert code == 0
+    cat = json.loads((out / "v1" / "catalog.json").read_text(encoding="utf-8"))
+    assert all(p["brand"] == "" for p in cat["products"])
+
+
+def test_infer_brand_uses_whole_words_and_the_longest_brand():
+    labels = ["Apple", "Jbl", "Hp", "Samsung", "Samsung a06", "Cougar"]
+    assert crawl.infer_brand("أريكة ألعاب Cougar Ranger S - رويال", labels) == "Cougar"
+    assert crawl.infer_brand("هاتف Samsung A06 - 64GB", labels) == "Samsung a06"
+    assert crawl.infer_brand("سماعة JBL Tune 520BT", labels) == "Jbl"
+    assert crawl.infer_brand("شاحن hpa-200 سريع", labels) == ""  # "hp" inside another word is not a match
+    assert crawl.infer_brand("تلفزيون تي سي إل 55 بوصة", labels) == ""
+
+
+def test_brand_is_taken_from_the_name_when_the_shop_filter_finds_nothing(tmp_path):
+    fake = FakeSite()
+    fake.products[1] = ("هاتف Apple iPhone 15", "1,850.000", "9-1", 2)
+    orig_get = fake.get
+
+    def get(path):
+        if "attribute_values=" in path:
+            return listing([], 1)  # the filter finds nothing, as on the live shop
+        return orig_get(path)
+
+    fake.get = get
+    code, out = run_with(fake, tmp_path)
+    assert code == 0
+    by_id = {p["id"]: p for p in json.loads((out / "v1" / "catalog.json").read_text(encoding="utf-8"))["products"]}
+    assert by_id[1]["brand"] == "Apple" and by_id[2]["brand"] == ""
+
+
+def test_page_that_says_few_pieces_are_left_is_shown_as_last_pieces():
+    page = product_page("InStock").replace(
+        "</body>", '<div class="availability_messages"><span>Only 2 left in stock</span></div></body>'
+    )
+    assert crawl.parse_product(page, "https://x.test")["stock"] == "low"
+    sold_out = product_page("OutOfStock").replace("</body>", '<div class="availability_messages">Only 2 left</div></body>')
+    assert crawl.parse_product(sold_out, "https://x.test")["stock"] == "out"
+    empty = product_page("InStock").replace("</body>", '<div class="availability_messages"></div></body>')
+    assert crawl.parse_product(empty, "https://x.test")["stock"] == "available"
+
+
+def test_state_of_an_older_reader_keeps_availability_but_rereads_brands_and_categories(tmp_path):
+    fake = FakeSite()
+    code, out = run_with(fake, tmp_path)
+    assert code == 0
+    state_path = out / "v1" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["schema"] == crawl.STATE_SCHEMA
+    # make it look like what the first (faulty) version wrote: no schema, "Apple" on everything
+    state.pop("schema")
+    state["brand_of"] = {k: "Apple" for k in state["brand_of"]}
+    state["category_of"] = {}
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    fake.hits.clear()
+    code, out2 = run_with(fake, tmp_path / "again", prev=state_path, budget=0)
+    assert code == 0
+    by_id = {p["id"]: p for p in json.loads((out2 / "v1" / "catalog.json").read_text(encoding="utf-8"))["products"]}
+    assert by_id[2]["brand"] == "Jbl" and by_id[1]["brand"] == "Apple" and by_id[3]["brand"] == "Apple"
+    assert by_id[2]["stock"] == "out"  # availability learnt earlier is kept without opening product pages
+    assert by_id[2]["category_id"] == 3
+    assert not [h for h in fake.hits if h.startswith("/ar/shop/item-")]
 
 
 def test_the_crawler_only_ever_reads(tmp_path):
